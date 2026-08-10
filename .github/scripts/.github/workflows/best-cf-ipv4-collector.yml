@@ -1,0 +1,62 @@
+name: Collect Best CF IPV4
+
+on:
+  schedule:
+    # 🌟 定时触发设置（二选一，默认开启 12 小时更新一次）：
+    - cron: '0 */12 * * *'   # 每 12 小时自动运行一次（北京时间 08:00 与 20:00）
+    # - cron: '0 0 * * *'    # 若想 24 小时运行一次，可取消注释本行并注释上一行
+  workflow_dispatch:          # 支持在 GitHub 网页手动点按钮触发
+
+concurrency:
+  group: Collect Best CF IPV4
+  cancel-in-progress: false
+
+# 🌟 显式声明 GitHub Actions 内容写入权限
+permissions:
+  contents: write
+
+jobs:
+  collect-best-cf-ipv4:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r .github/scripts/requirements.txt
+
+      - name: Get Playwright version
+        id: pw-version
+        run: |
+          VERSION=$(python -c 'from importlib.metadata import version; print(version("playwright"))')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Cache Playwright browsers
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pw-version.outputs.version }}
+
+      - name: Install Playwright Chromium
+        if: steps.pw-cache.outputs.cache-hit != 'true'
+        run: python -m playwright install --with-deps chromium
+
+      - name: Collect Best CF IPV4
+        run: python3 .github/scripts/best-cf-ipv4-collector.py
+
+      - name: Commit update
+        run: |
+          git config user.name "GitHub Action"
+          git config user.email "action@github.com"
+          git add best-cf-ipv4.txt
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "Best CF ipv4 list updated $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M')"
+          git pull --rebase
+          git push
