@@ -53,14 +53,12 @@ RETRY_BACKOFF_FACTOR: float = 2.0
 
 
 def _session() -> cf_requests.Session:
-    """创建模仿真实 Chrome TLS 算法指纹的请求 Session，轻松穿透 WAF"""
     session = cf_requests.Session(impersonate='chrome')
     session.headers.update(HEADERS)
     return session
 
 
 def fetch(session: cf_requests.Session, url: str, timeout: int = 15) -> str:
-    """带指数退避重试机制的 HTTP 请求"""
     last_err: Exception | None = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -76,7 +74,6 @@ def fetch(session: cf_requests.Session, url: str, timeout: int = 15) -> str:
 
 
 def extract_ipv4(text: str) -> set[str]:
-    """正则提取有效 IPv4 地址"""
     ips: set[str] = set()
     for match in re.finditer(IPV4_PATTERN, text):
         try:
@@ -88,14 +85,12 @@ def extract_ipv4(text: str) -> set[str]:
 
 
 def country_to_flag(code: str) -> str:
-    """ISO 国家简码转 Unicode Emoji 国旗标志"""
     if len(code) != 2 or code == 'XX':
         return ''
     return chr(ord(code[0]) - 65 + 0x1F1E6) + chr(ord(code[1]) - 65 + 0x1F1E6)
 
 
 def _ensure_xdb() -> None:
-    """自动下载离线 ip2region IP 数据库"""
     if XDB_FILE.exists():
         return
     XDB_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -108,11 +103,11 @@ def _ensure_xdb() -> None:
 
 _searcher = None
 
+
 def _get_searcher() -> 'Searcher':
-    """初始化离线 IP 查询器"""
     global _searcher
     if new_with_buffer is None:
-        raise RuntimeError('ip2region 未安装，请检查 requirements.txt')
+        raise RuntimeError('ip2region 未安装')
     if _searcher is None:
         _ensure_xdb()
         _searcher = new_with_buffer(
@@ -123,7 +118,6 @@ def _get_searcher() -> 'Searcher':
 
 
 def lookup_country(ip: str) -> str:
-    """离线本地查询 IP 归属地国家代码 (如 US, SG, JP)"""
     try:
         region = _get_searcher().search(ip)
         code = region.split('|')[-1].strip()
@@ -135,15 +129,14 @@ def lookup_country(ip: str) -> str:
 
 
 def beijing_timestamp() -> str:
-    """生成北京时间字符串"""
     return (datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%Y-%m-%d %H:%M')
 
 
 _browser = None
 _pw = None
 
+
 def _get_browser() -> 'Browser':
-    """启动 Playwright 无头浏览器（备用降级方案）"""
     global _browser, _pw
     if sync_playwright is None:
         raise RuntimeError('Playwright 未安装')
@@ -154,7 +147,6 @@ def _get_browser() -> 'Browser':
 
 
 def fetch_rendered(url: str, timeout: int = 30000) -> str:
-    """使用 Chromium 渲染 JS 动态页面"""
     context = _get_browser().new_context(user_agent=HEADERS['User-Agent'])
     page = context.new_page()
     try:
@@ -165,7 +157,6 @@ def fetch_rendered(url: str, timeout: int = 30000) -> str:
 
 
 def collect_ips(session: cf_requests.Session) -> set[str]:
-    """汇总抓取：优先 HTTP 快速获取，失败则降级开启无头浏览器"""
     all_ips: set[str] = set()
     tiers = [
         ('HTTP', lambda u: fetch(session, u)),
@@ -188,12 +179,46 @@ def collect_ips(session: cf_requests.Session) -> set[str]:
     return all_ips
 
 
-def enrich_locations(ips: set[str]) -> dict[str, str]:
-    """批量本地离线识别地理位置"""
+def filter_top_50_us_ips(all_ips: set[str]) -> dict[str, str]:
+    """仅保留美国 IP，并按照 C 段离散度精选 50 个最佳节点"""
     _get_searcher()
+    
+    # 1. 筛选出所有美国 IP
+    us_ips = []
+    for ip in all_ips:
+        if lookup_country(ip) == 'US':
+            us_ips.append(ip)
+
+    print(f'🇺🇸 共识别到 {len(us_ips)} 个美国节点，开始进行 C 段去重与筛选...')
+
+    # 2. 第一轮策略：每个 C 段 (x.x.x.0/24) 只保留 1 个代表 IP
+    seen_subnets = set()
+    selected_ips = []
+
+    for ip in us_ips:
+        c_subnet = '.'.join(ip.split('.')[:3])
+        if c_subnet not in seen_subnets:
+            seen_subnets.add(c_subnet)
+            selected_ips.append(ip)
+            if len(selected_ips) == 50:
+                break
+
+    # 3. 如果独立 C 段不足 50 个，进行第二轮补足（允许同 C 段最多 2 个 IP）
+    if len(selected_ips) < 50:
+        seen_counts = { '.'.join(ip.split('.')[:3]): 1 for ip in selected_ips }
+        for ip in us_ips:
+            if ip in selected_ips:
+                continue
+            c_subnet = '.'.join(ip.split('.')[:3])
+            if seen_counts.get(c_subnet, 0) < 2:
+                seen_counts[c_subnet] = seen_counts.get(c_subnet, 0) + 1
+                selected_ips.append(ip)
+                if len(selected_ips) == 50:
+                    break
+
     entries: dict[str, str] = {}
-    for ip in ips:
-        entries[f'{ip}:{PORT}'] = lookup_country(ip)
+    for ip in selected_ips:
+        entries[f'{ip}:{PORT}'] = 'US'
     return entries
 
 
@@ -207,17 +232,17 @@ def main() -> int:
         return 1
     print(f'\n全网去重后获得 {len(all_ips)} 个唯一 IPv4')
 
-    print('🌐 离线解析地理位置与标注国旗...')
-    entries = enrich_locations(all_ips)
+    print('🌐 离线解析地理位置，精选 50 个独立 C 段美国节点...')
+    entries = filter_top_50_us_ips(all_ips)
 
     tmp = OUTPUT_FILE.with_suffix('.tmp')
     timestamp = beijing_timestamp()
     with tmp.open('w', encoding='utf-8') as f:
-        f.write(f'#{len(entries)} bestips updated at {timestamp}\n')
+        f.write(f'#{len(entries)} best US ips updated at {timestamp}\n')
         for ip_port, location in entries.items():
             f.write(f'{ip_port}#{location} {country_to_flag(location)}\n')
     tmp.replace(OUTPUT_FILE)
-    print(f'\n✅ 成功将 {len(entries)} 个 IP 存入文件 {OUTPUT_FILE}')
+    print(f'\n✅ 成功将精选的 {len(entries)} 个美国 IP 存入文件 {OUTPUT_FILE}')
     return 0
 
 
