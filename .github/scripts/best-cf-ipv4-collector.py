@@ -24,15 +24,11 @@ if TYPE_CHECKING:
     from ip2region.searcher import Searcher
     from playwright.sync_api import Browser
 
-# 11 个专业优选 IP 数据源
+# 专供美国 IP 提取的精选数据源（剔除亚太杂质源）
 SOURCES: dict[str, str] = {
-    'https://www.wetest.vip/page/cloudfront/address_v4.html': 'WeTest',
-    'https://api.uouin.com/cloudflare.html': 'UOUIN',
+    'https://raw.githubusercontent.com/gslege/CloudflareIP/refs/heads/main/US.txt': 'Gslege-US',
     'https://bestcf.pages.dev/xinyitang3/ipv4.txt': 'Mia',
     'https://bestcf.pages.dev/tiancheng/all.txt': 'Tiancheng',
-    'https://raw.githubusercontent.com/gslege/CloudflareIP/refs/heads/main/SG.txt': 'Gslege-SG',
-    'https://raw.githubusercontent.com/gslege/CloudflareIP/refs/heads/main/DE.txt': 'Gslege-DE',
-    'https://raw.githubusercontent.com/gslege/CloudflareIP/refs/heads/main/US.txt': 'Gslege-US',
     'https://raw.githubusercontent.com/ymyuuu/IPDB/refs/heads/main/BestCF/bestcfv4.txt': 'IPDB',
     'https://vps789.com/openApi/cfIpApi': 'VPS789',
     'https://api.4ce.cn/api/bestCFIP': 'vvhan',
@@ -173,71 +169,63 @@ def collect_ips(session: cf_requests.Session) -> set[str]:
     return all_ips
 
 
-def filter_top_30_us_ips(all_ips: set[str]) -> list[str]:
-    """仅保留美国 IP，并按照 C 段离散度精选 30 个最佳节点"""
+def filter_top_30_us_ips(all_ips: set[str], target_count: int = 30) -> list[str]:
     _get_searcher()
 
-    # 1. 离线识别，筛选出所有美国 IP
+    # 离线识别校验，严格抽取美国节点
     us_ips = [ip for ip in all_ips if lookup_country(ip) == 'US']
-    print(f'🇺🇸 共识别到 {len(us_ips)} 个美国节点，开始进行 C 段打散精选...')
+    print(f'🇺🇸 成功筛选到 {len(us_ips)} 个美国节点，进行 C 段打散精选...')
 
-    # 2. 第一轮：每个 C 段 (x.x.x.0/24) 只保留 1 个代表 IP
     seen_subnets = set()
     selected_ips = []
 
+    # C 段分散，优先选取不同网段的 IP
     for ip in us_ips:
         c_subnet = '.'.join(ip.split('.')[:3])
         if c_subnet not in seen_subnets:
             seen_subnets.add(c_subnet)
             selected_ips.append(ip)
-            if len(selected_ips) == 30:
+            if len(selected_ips) == target_count:
                 break
 
-    # 3. 如果独立 C 段不足 30 个，进行第二轮补足（允许同 C 段最多 2 个 IP）
-    if len(selected_ips) < 30:
-        seen_counts = {'.'.join(ip.split('.')[:3]): 1 for ip in selected_ips}
+    # 补充不足数量
+    if len(selected_ips) < target_count:
         for ip in us_ips:
-            if ip in selected_ips:
-                continue
-            c_subnet = '.'.join(ip.split('.')[:3])
-            if seen_counts.get(c_subnet, 0) < 2:
-                seen_counts[c_subnet] = seen_counts.get(c_subnet, 0) + 1
+            if ip not in selected_ips:
                 selected_ips.append(ip)
-                if len(selected_ips) == 30:
+                if len(selected_ips) == target_count:
                     break
 
     return selected_ips
 
 
 def main() -> int:
-    print('🚀 开始获取 Cloudflare 全网数据源...\n')
+    print('🚀 开始拉取 Cloudflare 节点数据...\n')
     session = _session()
 
     all_ips = collect_ips(session)
     if not all_ips:
         print('❌ 未抓取到任何 IP')
         return 1
-    print(f'\n全网去重共得 {len(all_ips)} 个 IP')
+    print(f'\n全网去重共得 {len(all_ips)} 个唯一 IPv4')
 
-    print('🌐 本地离线识别美国节点并精选 30 个离散 C 段...')
-    final_us_ips = filter_top_30_us_ips(all_ips)
+    final_us_ips = filter_top_30_us_ips(all_ips, target_count=30)
 
     if not final_us_ips:
-        print('❌ 未筛选到美国节点')
+        print('❌ 未匹配到美国节点')
         return 1
 
     tmp = OUTPUT_FILE.with_suffix('.tmp')
     timestamp = beijing_timestamp()
 
-    # 格式化输出带编号备注：🇺🇸美国01、🇺🇸美国02...30
+    # 输出格式：IP:443#🇺🇸美国01 ~ 30
     with tmp.open('w', encoding='utf-8') as f:
         f.write(f'#{len(final_us_ips)} best US ips updated at {timestamp}\n')
         for idx, ip in enumerate(final_us_ips, 1):
-            num_str = f"{idx:02d}"
-            f.write(f'{ip}:{PORT}#🇺🇸美国{num_str}\n')
+            f.write(f'{ip}:{PORT}#🇺🇸美国{idx:02d}\n')
 
     tmp.replace(OUTPUT_FILE)
-    print(f'\n✅ 成功保存 {len(final_us_ips)} 个精选美国节点至 {OUTPUT_FILE}')
+    print(f'\n✅ 成功筛选出 {len(final_us_ips)} 个完全独立的美国节点，已保存至 {OUTPUT_FILE}')
     return 0
 
 
