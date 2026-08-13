@@ -1,18 +1,12 @@
-import concurrent.futures
 import ipaddress
 import re
 import sys
 import time
-import urllib3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import requests
 from curl_cffi import requests as cf_requests
-
-# 屏蔽 verify=False 产生的 SSL 警告
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 try:
     from playwright.sync_api import sync_playwright
@@ -46,7 +40,6 @@ SOURCES: dict[str, str] = {
 }
 
 PORT: str = '443'
-CHECK_HOST: str = 'check.proxyip.cmliussss.net'
 HEADERS: dict[str, str] = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
                   '(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0',
@@ -60,7 +53,6 @@ RETRY_BACKOFF_FACTOR: float = 2.0
 
 
 def _session() -> cf_requests.Session:
-    """用于爬取源站数据的伪装 Chrome Session"""
     session = cf_requests.Session(impersonate='chrome')
     session.headers.update(HEADERS)
     return session
@@ -181,71 +173,40 @@ def collect_ips(session: cf_requests.Session) -> set[str]:
     return all_ips
 
 
-def test_proxy_ip(ip: str, port: str = PORT, timeout: float = 2.5) -> bool:
-    """高效极速版：检测 Cloudflare IP 是否可正常代理转发请求"""
-    target_url = f"https://{ip}:{port}/"
-    headers = {
-        "Host": CHECK_HOST,
-        "User-Agent": HEADERS["User-Agent"]
-    }
-    try:
-        # 采用原生 requests 轻量高效发起 HTTPS 探测
-        resp = requests.get(
-            target_url,
-            headers=headers,
-            timeout=timeout,
-            verify=False
-        )
-        if resp.status_code == 200:
-            return True
-    except Exception:
-        pass
-    return False
-
-
-def verify_and_filter_us_ips(all_ips: set[str], target_count: int = 30) -> list[str]:
+def filter_top_30_us_ips(all_ips: set[str]) -> list[str]:
+    """仅保留美国 IP，并按照 C 段离散度精选 30 个最佳节点"""
     _get_searcher()
-    
-    # 1. 过滤美国 IP
-    us_ips = [ip for ip in all_ips if lookup_country(ip) == 'US']
-    print(f'🇺🇸 识别到 {len(us_ips)} 个美国候选节点，开始做 C 段去重与可用性测速...')
 
-    # 2. C 段网络打散策略
+    # 1. 离线识别，筛选出所有美国 IP
+    us_ips = [ip for ip in all_ips if lookup_country(ip) == 'US']
+    print(f'🇺🇸 共识别到 {len(us_ips)} 个美国节点，开始进行 C 段打散精选...')
+
+    # 2. 第一轮：每个 C 段 (x.x.x.0/24) 只保留 1 个代表 IP
     seen_subnets = set()
-    candidate_ips = []
-    
+    selected_ips = []
+
     for ip in us_ips:
         c_subnet = '.'.join(ip.split('.')[:3])
         if c_subnet not in seen_subnets:
             seen_subnets.add(c_subnet)
-            candidate_ips.append(ip)
-            
-    for ip in us_ips:
-        if ip not in candidate_ips:
-            candidate_ips.append(ip)
+            selected_ips.append(ip)
+            if len(selected_ips) == 30:
+                break
 
-    # 3. 多线程并发测速
-    valid_ips = []
-    print(f'🌐 开始并发测试节点连通性 (目标精选 {target_count} 个)...\n')
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-        future_to_ip = {executor.submit(test_proxy_ip, ip): ip for ip in candidate_ips}
-        for future in concurrent.futures.as_completed(future_to_ip):
-            ip = future_to_ip[future]
-            try:
-                is_ok = future.result()
-                if is_ok:
-                    valid_ips.append(ip)
-                    print(f'  ✅ [可用] {ip}:{PORT}')
-                    if len(valid_ips) >= target_count:
-                        print(f'\n🎉 已成功凑齐 {target_count} 个合格节点，结束测速！')
-                        break
-                else:
-                    print(f'  ❌ [不可用] {ip}:{PORT}')
-            except Exception:
-                pass
+    # 3. 如果独立 C 段不足 30 个，进行第二轮补足（允许同 C 段最多 2 个 IP）
+    if len(selected_ips) < 30:
+        seen_counts = {'.'.join(ip.split('.')[:3]): 1 for ip in selected_ips}
+        for ip in us_ips:
+            if ip in selected_ips:
+                continue
+            c_subnet = '.'.join(ip.split('.')[:3])
+            if seen_counts.get(c_subnet, 0) < 2:
+                seen_counts[c_subnet] = seen_counts.get(c_subnet, 0) + 1
+                selected_ips.append(ip)
+                if len(selected_ips) == 30:
+                    break
 
-    return valid_ips[:target_count]
+    return selected_ips
 
 
 def main() -> int:
@@ -258,24 +219,25 @@ def main() -> int:
         return 1
     print(f'\n全网去重共得 {len(all_ips)} 个 IP')
 
-    final_us_ips = verify_and_filter_us_ips(all_ips, target_count=30)
+    print('🌐 本地离线识别美国节点并精选 30 个离散 C 段...')
+    final_us_ips = filter_top_30_us_ips(all_ips)
 
     if not final_us_ips:
-        print('❌ 未检测到可用的美国节点')
+        print('❌ 未筛选到美国节点')
         return 1
 
     tmp = OUTPUT_FILE.with_suffix('.tmp')
     timestamp = beijing_timestamp()
-    
-    # 按照 🇺🇸美国01、🇺🇸美国02...30 进行格式化输出
+
+    # 格式化输出带编号备注：🇺🇸美国01、🇺🇸美国02...30
     with tmp.open('w', encoding='utf-8') as f:
         f.write(f'#{len(final_us_ips)} best US ips updated at {timestamp}\n')
         for idx, ip in enumerate(final_us_ips, 1):
             num_str = f"{idx:02d}"
             f.write(f'{ip}:{PORT}#🇺🇸美国{num_str}\n')
-            
+
     tmp.replace(OUTPUT_FILE)
-    print(f'\n✅ 成功将 {len(final_us_ips)} 个测速合格的美国节点写入 {OUTPUT_FILE}')
+    print(f'\n✅ 成功保存 {len(final_us_ips)} 个精选美国节点至 {OUTPUT_FILE}')
     return 0
 
 
