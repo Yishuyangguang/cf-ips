@@ -1,3 +1,4 @@
+import concurrent.futures
 import ipaddress
 import re
 import sys
@@ -40,6 +41,7 @@ SOURCES: dict[str, str] = {
 }
 
 PORT: str = '443'
+CHECK_URL: str = 'https://check.proxyip.cmliussss.net/'
 HEADERS: dict[str, str] = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
                   '(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0',
@@ -82,12 +84,6 @@ def extract_ipv4(text: str) -> set[str]:
         except ValueError:
             continue
     return ips
-
-
-def country_to_flag(code: str) -> str:
-    if len(code) != 2 or code == 'XX':
-        return ''
-    return chr(ord(code[0]) - 65 + 0x1F1E6) + chr(ord(code[1]) - 65 + 0x1F1E6)
 
 
 def _ensure_xdb() -> None:
@@ -167,82 +163,115 @@ def collect_ips(session: cf_requests.Session) -> set[str]:
             try:
                 ips = extract_ipv4(fetcher(url))
             except Exception as e:
-                print(f'  [{name}] {label} 尝试失败: {e}')
+                print(f'  [{name}] {label} 失败: {e}')
                 continue
             if ips:
                 all_ips.update(ips)
-                print(f'  [{name}] {label} 成功抓取: {len(ips)} 个 IPv4')
+                print(f'  [{name}] {label}: {len(ips)} IPv4')
                 break
-            print(f'  [{name}] {label}: 0 个 IP，尝试降级引擎...')
+            print(f'  [{name}] {label}: 0 IPv4，尝试降级...')
         else:
-            print(f'  [{name}] 所有抓取模式均失败')
+            print(f'  [{name}] 抓取失败')
     return all_ips
 
 
-def filter_top_50_us_ips(all_ips: set[str]) -> dict[str, str]:
-    """仅保留美国 IP，并按照 C 段离散度精选 50 个最佳节点"""
+def test_proxy_ip(ip: str, port: str = PORT, timeout: float = 3.5) -> bool:
+    """向 https://check.proxyip.cmliussss.net/ 校验 Proxy IP 可用性"""
+    target_url = f"https://{ip}:{port}/"
+    headers = {
+        "Host": "check.proxyip.cmliussss.net",
+        "User-Agent": HEADERS["User-Agent"]
+    }
+    try:
+        with cf_requests.Session(impersonate='chrome') as session:
+            resp = session.get(
+                target_url,
+                headers=headers,
+                timeout=timeout,
+                verify=False
+            )
+            if resp.status_code == 200:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def verify_and_filter_us_ips(all_ips: set[str], target_count: int = 30) -> list[str]:
+    """筛选美国 IP，并通过并发测速选出 30 个可用节点"""
     _get_searcher()
     
-    # 1. 筛选出所有美国 IP
-    us_ips = []
-    for ip in all_ips:
-        if lookup_country(ip) == 'US':
-            us_ips.append(ip)
+    # 1. 过滤出所有美国 IP
+    us_ips = [ip for ip in all_ips if lookup_country(ip) == 'US']
+    print(f'🇺🇸 识别到 {len(us_ips)} 个美国候选节点，开始进行 C 段去重与可用性测速...')
 
-    print(f'🇺🇸 共识别到 {len(us_ips)} 个美国节点，开始进行 C 段去重与筛选...')
-
-    # 2. 第一轮策略：每个 C 段 (x.x.x.0/24) 只保留 1 个代表 IP
+    # 2. 优先打散 C 段网段
     seen_subnets = set()
-    selected_ips = []
-
+    candidate_ips = []
+    
     for ip in us_ips:
         c_subnet = '.'.join(ip.split('.')[:3])
         if c_subnet not in seen_subnets:
             seen_subnets.add(c_subnet)
-            selected_ips.append(ip)
-            if len(selected_ips) == 50:
-                break
+            candidate_ips.append(ip)
+            
+    for ip in us_ips:
+        if ip not in candidate_ips:
+            candidate_ips.append(ip)
 
-    # 3. 如果独立 C 段不足 50 个，进行第二轮补足（允许同 C 段最多 2 个 IP）
-    if len(selected_ips) < 50:
-        seen_counts = { '.'.join(ip.split('.')[:3]): 1 for ip in selected_ips }
-        for ip in us_ips:
-            if ip in selected_ips:
-                continue
-            c_subnet = '.'.join(ip.split('.')[:3])
-            if seen_counts.get(c_subnet, 0) < 2:
-                seen_counts[c_subnet] = seen_counts.get(c_subnet, 0) + 1
-                selected_ips.append(ip)
-                if len(selected_ips) == 50:
-                    break
+    # 3. 多线程测速校验
+    valid_ips = []
+    print(f'🌐 正对 {CHECK_URL} 进行并发测速测试...\n')
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        future_to_ip = {executor.submit(test_proxy_ip, ip): ip for ip in candidate_ips}
+        for future in concurrent.futures.as_completed(future_to_ip):
+            ip = future_to_ip[future]
+            try:
+                is_ok = future.result()
+                if is_ok:
+                    valid_ips.append(ip)
+                    print(f'  ✅ [可用] {ip}:{PORT}')
+                    if len(valid_ips) >= target_count:
+                        # 已集齐 30 个可用 IP，取消剩余任务
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        break
+                else:
+                    print(f'  ❌ [不可用] {ip}:{PORT}')
+            except Exception:
+                pass
 
-    entries: dict[str, str] = {}
-    for ip in selected_ips:
-        entries[f'{ip}:{PORT}'] = 'US'
-    return entries
+    return valid_ips[:target_count]
 
 
 def main() -> int:
-    print('🚀 开始汇总 Cloudflare 优质 IP 地址...\n')
+    print('🚀 开始获取 Cloudflare 节点...\n')
     session = _session()
 
     all_ips = collect_ips(session)
     if not all_ips:
-        print('❌ 未获取到任何 IP')
+        print('❌ 未抓取到任何 IP')
         return 1
-    print(f'\n全网去重后获得 {len(all_ips)} 个唯一 IPv4')
+    print(f'\n全网去重共得 {len(all_ips)} 个 IP')
 
-    print('🌐 离线解析地理位置，精选 50 个独立 C 段美国节点...')
-    entries = filter_top_50_us_ips(all_ips)
+    final_us_ips = verify_and_filter_us_ips(all_ips, target_count=30)
+
+    if not final_us_ips:
+        print('❌ 未测出可用的美国节点')
+        return 1
 
     tmp = OUTPUT_FILE.with_suffix('.tmp')
     timestamp = beijing_timestamp()
+    
+    # 写入文件，格式化带编号备注：🇺🇸美国01、🇺🇸美国02 ...
     with tmp.open('w', encoding='utf-8') as f:
-        f.write(f'#{len(entries)} best US ips updated at {timestamp}\n')
-        for ip_port, location in entries.items():
-            f.write(f'{ip_port}#{location} {country_to_flag(location)}\n')
+        f.write(f'#{len(final_us_ips)} best US ips updated at {timestamp}\n')
+        for idx, ip in enumerate(final_us_ips, 1):
+            num_str = f"{idx:02d}"  # 补全为 01, 02 ... 30
+            f.write(f'{ip}:{PORT}#🇺🇸美国{num_str}\n')
+            
     tmp.replace(OUTPUT_FILE)
-    print(f'\n✅ 成功将精选的 {len(entries)} 个美国 IP 存入文件 {OUTPUT_FILE}')
+    print(f'\n🎉 成功将测速合格的 {len(final_us_ips)} 个美国节点保存至 {OUTPUT_FILE}')
     return 0
 
 
