@@ -3,11 +3,16 @@ import ipaddress
 import re
 import sys
 import time
+import urllib3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import requests
 from curl_cffi import requests as cf_requests
+
+# 屏蔽 verify=False 产生的 SSL 警告
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 try:
     from playwright.sync_api import sync_playwright
@@ -41,7 +46,7 @@ SOURCES: dict[str, str] = {
 }
 
 PORT: str = '443'
-CHECK_URL: str = 'https://check.proxyip.cmliussss.net/'
+CHECK_HOST: str = 'check.proxyip.cmliussss.net'
 HEADERS: dict[str, str] = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
                   '(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0',
@@ -55,6 +60,7 @@ RETRY_BACKOFF_FACTOR: float = 2.0
 
 
 def _session() -> cf_requests.Session:
+    """用于爬取源站数据的伪装 Chrome Session"""
     session = cf_requests.Session(impersonate='chrome')
     session.headers.update(HEADERS)
     return session
@@ -163,49 +169,48 @@ def collect_ips(session: cf_requests.Session) -> set[str]:
             try:
                 ips = extract_ipv4(fetcher(url))
             except Exception as e:
-                print(f'  [{name}] {label} 失败: {e}')
+                print(f'  [{name}] {label} 尝试失败: {e}')
                 continue
             if ips:
                 all_ips.update(ips)
-                print(f'  [{name}] {label}: {len(ips)} IPv4')
+                print(f'  [{name}] {label} 成功抓取: {len(ips)} 个 IPv4')
                 break
-            print(f'  [{name}] {label}: 0 IPv4，尝试降级...')
+            print(f'  [{name}] {label}: 0 个 IP，尝试降级...')
         else:
-            print(f'  [{name}] 抓取失败')
+            print(f'  [{name}] 所有模式均失败')
     return all_ips
 
 
-def test_proxy_ip(ip: str, port: str = PORT, timeout: float = 3.5) -> bool:
-    """向 https://check.proxyip.cmliussss.net/ 校验 Proxy IP 可用性"""
+def test_proxy_ip(ip: str, port: str = PORT, timeout: float = 2.5) -> bool:
+    """高效极速版：检测 Cloudflare IP 是否可正常代理转发请求"""
     target_url = f"https://{ip}:{port}/"
     headers = {
-        "Host": "check.proxyip.cmliussss.net",
+        "Host": CHECK_HOST,
         "User-Agent": HEADERS["User-Agent"]
     }
     try:
-        with cf_requests.Session(impersonate='chrome') as session:
-            resp = session.get(
-                target_url,
-                headers=headers,
-                timeout=timeout,
-                verify=False
-            )
-            if resp.status_code == 200:
-                return True
+        # 采用原生 requests 轻量高效发起 HTTPS 探测
+        resp = requests.get(
+            target_url,
+            headers=headers,
+            timeout=timeout,
+            verify=False
+        )
+        if resp.status_code == 200:
+            return True
     except Exception:
         pass
     return False
 
 
 def verify_and_filter_us_ips(all_ips: set[str], target_count: int = 30) -> list[str]:
-    """筛选美国 IP，并通过并发测速选出 30 个可用节点"""
     _get_searcher()
     
-    # 1. 过滤出所有美国 IP
+    # 1. 过滤美国 IP
     us_ips = [ip for ip in all_ips if lookup_country(ip) == 'US']
-    print(f'🇺🇸 识别到 {len(us_ips)} 个美国候选节点，开始进行 C 段去重与可用性测速...')
+    print(f'🇺🇸 识别到 {len(us_ips)} 个美国候选节点，开始做 C 段去重与可用性测速...')
 
-    # 2. 优先打散 C 段网段
+    # 2. C 段网络打散策略
     seen_subnets = set()
     candidate_ips = []
     
@@ -219,9 +224,9 @@ def verify_and_filter_us_ips(all_ips: set[str], target_count: int = 30) -> list[
         if ip not in candidate_ips:
             candidate_ips.append(ip)
 
-    # 3. 多线程测速校验
+    # 3. 多线程并发测速
     valid_ips = []
-    print(f'🌐 正对 {CHECK_URL} 进行并发测速测试...\n')
+    print(f'🌐 开始并发测试节点连通性 (目标精选 {target_count} 个)...\n')
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
         future_to_ip = {executor.submit(test_proxy_ip, ip): ip for ip in candidate_ips}
@@ -233,8 +238,7 @@ def verify_and_filter_us_ips(all_ips: set[str], target_count: int = 30) -> list[
                     valid_ips.append(ip)
                     print(f'  ✅ [可用] {ip}:{PORT}')
                     if len(valid_ips) >= target_count:
-                        # 已集齐 30 个可用 IP，取消剩余任务
-                        executor.shutdown(wait=False, cancel_futures=True)
+                        print(f'\n🎉 已成功凑齐 {target_count} 个合格节点，结束测速！')
                         break
                 else:
                     print(f'  ❌ [不可用] {ip}:{PORT}')
@@ -245,7 +249,7 @@ def verify_and_filter_us_ips(all_ips: set[str], target_count: int = 30) -> list[
 
 
 def main() -> int:
-    print('🚀 开始获取 Cloudflare 节点...\n')
+    print('🚀 开始获取 Cloudflare 全网数据源...\n')
     session = _session()
 
     all_ips = collect_ips(session)
@@ -257,21 +261,21 @@ def main() -> int:
     final_us_ips = verify_and_filter_us_ips(all_ips, target_count=30)
 
     if not final_us_ips:
-        print('❌ 未测出可用的美国节点')
+        print('❌ 未检测到可用的美国节点')
         return 1
 
     tmp = OUTPUT_FILE.with_suffix('.tmp')
     timestamp = beijing_timestamp()
     
-    # 写入文件，格式化带编号备注：🇺🇸美国01、🇺🇸美国02 ...
+    # 按照 🇺🇸美国01、🇺🇸美国02...30 进行格式化输出
     with tmp.open('w', encoding='utf-8') as f:
         f.write(f'#{len(final_us_ips)} best US ips updated at {timestamp}\n')
         for idx, ip in enumerate(final_us_ips, 1):
-            num_str = f"{idx:02d}"  # 补全为 01, 02 ... 30
+            num_str = f"{idx:02d}"
             f.write(f'{ip}:{PORT}#🇺🇸美国{num_str}\n')
             
     tmp.replace(OUTPUT_FILE)
-    print(f'\n🎉 成功将测速合格的 {len(final_us_ips)} 个美国节点保存至 {OUTPUT_FILE}')
+    print(f'\n✅ 成功将 {len(final_us_ips)} 个测速合格的美国节点写入 {OUTPUT_FILE}')
     return 0
 
 
