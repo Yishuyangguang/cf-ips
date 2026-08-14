@@ -26,9 +26,10 @@ if TYPE_CHECKING:
 
 # 专供美国 IP 提取的精选数据源（剔除亚太杂质源）
 SOURCES: dict[str, str] = {
+SOURCES: dict[str, str] = {
+    'https://proxyip.chatkg.qzz.io/': 'ChatKG-ProxyIP',  # 👈 新加的数据源
     'https://raw.githubusercontent.com/gslege/CloudflareIP/refs/heads/main/US.txt': 'Gslege-US',
     'https://bestcf.pages.dev/xinyitang3/ipv4.txt': 'Mia',
-    'https://bestcf.pages.dev/tiancheng/all.txt': 'Tiancheng',
     'https://raw.githubusercontent.com/ymyuuu/IPDB/refs/heads/main/BestCF/bestcfv4.txt': 'IPDB',
     'https://vps789.com/openApi/cfIpApi': 'VPS789',
     'https://api.4ce.cn/api/bestCFIP': 'vvhan',
