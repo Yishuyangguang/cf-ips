@@ -14,6 +14,8 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: setup-python@v5
@@ -32,6 +34,6 @@ jobs:
           if git diff --staged --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "Auto Update: Best 30 US Cloudflare IPv4"
-            git push
+            git commit -m "Auto Update: Best 30 US Cloudflare IPv4 [skip ci]"
+            git push origin ${{ github.ref_name }}
           fi
