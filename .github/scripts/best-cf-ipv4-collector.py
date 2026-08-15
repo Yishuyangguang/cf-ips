@@ -45,7 +45,7 @@ US_COLO_SET = {
     'HNL', 'ANC'
 }
 
-# 4. 内置高可用保底 Anycast 官方种子池（防远程源 404）
+# 4. 内置高可用保底 Anycast 官方种子池
 BUILTIN_SEED_IPS = [
     "104.16.132.229", "104.16.133.229", "104.17.150.10", "104.18.20.100",
     "104.19.18.150", "104.20.45.8", "104.21.12.1", "104.22.3.99",
@@ -56,7 +56,6 @@ BUILTIN_SEED_IPS = [
 ]
 
 def is_cloudflare_ip(ip_str):
-    """严格校验是否属于 Cloudflare 官方 IPv4"""
     try:
         ip_obj = ipaddress.ip_address(ip_str)
         return any(ip_obj in net for net in CF_IPV4_NETWORKS)
@@ -64,7 +63,6 @@ def is_cloudflare_ip(ip_str):
         return False
 
 def fetch_source_ips(url):
-    """带超时与容错机制的抓取器"""
     ips = set()
     try:
         req = Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
@@ -80,7 +78,6 @@ def fetch_source_ips(url):
     return ips
 
 def fast_tcp_check(ip, port=443, timeout=0.8):
-    """【第一阶段】毫秒级 TCP 快速探活粗筛"""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(timeout)
@@ -91,35 +88,35 @@ def fast_tcp_check(ip, port=443, timeout=0.8):
         return None
 
 def trace_us_node(ip, timeout=1.5):
-    """【第二阶段】TLS 443 SNI 毫秒级嗅探机房与真实延迟（单次直读，0 阻塞）"""
     start_time = time.time()
     sock = None
     ssl_sock = None
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-        sock.connect((ip, 443))
-        
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
         
         ssl_sock = ctx.wrap_socket(sock, server_hostname="speed.cloudflare.com")
         ssl_sock.settimeout(timeout)
-        
+        ssl_sock.connect((ip, 443))
+
         req = "GET /cdn-cgi/trace HTTP/1.1\r\nHost: speed.cloudflare.com\r\nUser-Agent: curl/7.88.1\r\nConnection: close\r\n\r\n"
         ssl_sock.sendall(req.encode('utf-8'))
-        
-        # 核心优化：trace 响应仅 300 字节，一次性读取 4096 字节，杜绝 while 循环超时
+
         data = ssl_sock.recv(4096).decode('utf-8', errors='ignore')
         latency_ms = (time.time() - start_time) * 1000
-        
+
         if "colo=" in data:
             colo_match = re.search(r'colo=([A-Z]{3})', data)
-            if colo_match:
-                colo = colo_match.group(1)
-                if colo in US_COLO_SET:
-                    return (ip, latency_ms, colo)
+            loc_match = re.search(r'loc=([A-Z]{2})', data)
+            colo = colo_match.group(1) if colo_match else ""
+            loc = loc_match.group(1) if loc_match else ""
+            
+            if colo in US_COLO_SET or loc == "US":
+                return (ip, latency_ms, colo or loc)
         return (ip, None, None)
     except Exception:
         return (ip, None, None)
