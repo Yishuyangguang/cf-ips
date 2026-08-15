@@ -1,12 +1,13 @@
 import os
 import re
 import socket
+import ssl
 import time
 import ipaddress
 import concurrent.futures
 from urllib.request import Request, urlopen
 
-# Cloudflare 官方 IPv4 网段白名单
+# 1. Cloudflare 官方 IPv4 网段白名单
 CF_IPV4_NETWORKS = [
     ipaddress.ip_network('173.245.48.0/20'),
     ipaddress.ip_network('103.21.244.0/22'),
@@ -25,7 +26,7 @@ CF_IPV4_NETWORKS = [
     ipaddress.ip_network('131.0.72.0/22')
 ]
 
-# 远程高质量 Cloudflare IP 数据源
+# 2. 远程优质 Cloudflare IP 数据源
 SOURCES = [
     "https://raw.githubusercontent.com/ymyuuu/IPDB/main/bestcf.txt",
     "https://raw.githubusercontent.com/ip-scanner/cloudflare/master/clean-ips.txt",
@@ -33,7 +34,7 @@ SOURCES = [
     "https://www.cloudflare.com/ips-v4"
 ]
 
-# 🇺🇸 Cloudflare 美国本土所有核心机房机场代码（IATA COLO）
+# 3. 🇺🇸 Cloudflare 美国本土核心机房机场代码（IATA COLO）
 US_COLO_SET = {
     # 美西
     'LAX', 'SFO', 'SJC', 'SMF', 'SAN', 'SEA', 'PDX', 'PHX', 'LAS', 'SLC', 'DEN', 'BOI', 'RNO',
@@ -46,7 +47,7 @@ US_COLO_SET = {
 }
 
 def is_cloudflare_ip(ip_str):
-    """严格校验是否为 Cloudflare 官方公网 IPv4"""
+    """严格校验是否属于 Cloudflare 官方 IPv4"""
     try:
         ip_obj = ipaddress.ip_address(ip_str)
         return any(ip_obj in net for net in CF_IPV4_NETWORKS)
@@ -54,7 +55,7 @@ def is_cloudflare_ip(ip_str):
         return False
 
 def fetch_source_ips(url):
-    """带超时与容错的远程源抓取"""
+    """带超时与容错机制的抓取器"""
     ips = set()
     try:
         req = Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
@@ -64,42 +65,64 @@ def fetch_source_ips(url):
             for ip in matches:
                 if is_cloudflare_ip(ip):
                     ips.add(ip)
-        print(f"✅ 成功从 [{url}] 抓取并清洗出 {len(ips)} 个有效 CF 节点")
+        print(f"✅ 成功从 [{url}] 抓取并提取出 {len(ips)} 个官方有效 IP")
     except Exception as e:
         print(f"⚠️ 跳过异常源 [{url}]: {e}")
     return ips
 
-def test_and_filter_us_ip(ip, timeout=2.0):
-    """
-    测速 + 美国机房（Colo）精准嗅探
-    返回: (ip, latency_ms, colo_code) 或 (ip, None, None)
-    """
-    start_time = time.time()
+def fast_tcp_check(ip, port=443, timeout=1.0):
+    """【第一阶段】毫秒级 TCP 快速探活粗筛"""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(timeout)
-        sock.connect((ip, 80))
-        
-        http_req = (
-            f"GET /cdn-cgi/trace HTTP/1.1\r\n"
-            f"Host: speed.cloudflare.com\r\n"
-            f"User-Agent: Mozilla/5.0\r\n"
-            f"Connection: close\r\n\r\n"
-        )
-        sock.sendall(http_req.encode('utf-8'))
-        
-        response = sock.recv(1024).decode('utf-8', errors='ignore')
+        sock.connect((ip, port))
         sock.close()
+        return ip
+    except Exception:
+        return None
+
+def trace_us_node(ip, timeout=2.0):
+    """【第二阶段】TLS 443 SNI 精准嗅探机房归属与真实延迟"""
+    start_time = time.time()
+    try:
+        # 创建 SSL 上下文（免校验证书名称以支持直连 IP）
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+
+        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw_sock.settimeout(timeout)
         
+        # 建立带 SNI 的 TLS 安全连接
+        with ssl_ctx.wrap_socket(raw_sock, server_hostname="speed.cloudflare.com") as ssl_sock:
+            ssl_sock.connect((ip, 443))
+            
+            http_req = (
+                f"GET /cdn-cgi/trace HTTP/1.1\r\n"
+                f"Host: speed.cloudflare.com\r\n"
+                f"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n"
+                f"Connection: close\r\n\r\n"
+            )
+            ssl_sock.sendall(http_req.encode('utf-8'))
+            
+            response = b""
+            while True:
+                chunk = ssl_sock.recv(1024)
+                if not chunk:
+                    break
+                response += chunk
+
         latency_ms = (time.time() - start_time) * 1000
-        
-        # 提取机房代码 (如 colo=LAX)
-        colo_match = re.search(r'colo=([A-Z]{3})', response)
-        if colo_match:
-            colo = colo_match.group(1)
-            if colo in US_COLO_SET:
-                return (ip, latency_ms, colo)
-        
+        text_resp = response.decode('utf-8', errors='ignore')
+
+        # 严格校验 HTTP 200 与机房信息
+        if "HTTP/1.1 200 OK" in text_resp or "HTTP/2 200" in text_resp:
+            colo_match = re.search(r'colo=([A-Z]{3})', text_resp)
+            if colo_match:
+                colo = colo_match.group(1)
+                if colo in US_COLO_SET:
+                    return (ip, latency_ms, colo)
+
         return (ip, None, None)
     except Exception:
         return (ip, None, None)
@@ -116,41 +139,62 @@ def main():
         print("❌ 未获取到可用 IP，退出")
         return
 
-    print("⚡ 启动 50 线程并发进行【延迟测速 + 美国机房嗅探】...")
+    # 1. 快速 TCP 粗筛
+    print("⚡ 启动 60 线程进行极速 TCP 探活粗筛...")
+    alive_ips = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=60) as executor:
+        futures = [executor.submit(fast_tcp_check, ip) for ip in all_raw_ips]
+        for f in concurrent.futures.as_completed(futures):
+            res = f.result()
+            if res:
+                alive_ips.append(res)
+
+    print(f"🎉 存活节点数: {len(alive_ips)} 个，进入 TLS 机房深度嗅探...")
+
+    # 2. 深度 Trace 嗅探与测速
     us_results = []
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
-        futures = {executor.submit(test_and_filter_us_ip, ip): ip for ip in all_raw_ips}
-        for future in concurrent.futures.as_completed(futures):
-            ip, latency, colo = future.result()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
+        futures = {executor.submit(trace_us_node, ip): ip for ip in alive_ips}
+        for f in concurrent.futures.as_completed(futures):
+            ip, latency, colo = f.result()
             if latency is not None and colo is not None:
                 us_results.append((ip, latency, colo))
 
-    # 按延迟由低到高排序
+    # 按真实延迟升序排序
     us_results.sort(key=lambda x: x[1])
-    print(f"\n🎉 成功嗅探到纯美国 (US) 节点: {len(us_results)} 个")
+    print(f"\n🇺🇸 成功嗅探到纯正美国节点: {len(us_results)} 个")
 
-    # 提取前 30 个最优且绝对唯一的美国 IP，并自动添加 🇺🇸美国01~30 备注
-    seen_ips = set()
+    # 3. C 段网段打散算法（每个 /24 子网最多取 2 个 IP，提升容灾抗封锁能力）
+    subnet_count = {}
     best_us_ips = []
-    
+    seen_ips = set()
+
     for ip, latency, colo in us_results:
-        if ip not in seen_ips:
+        if ip in seen_ips:
+            continue
+
+        # 提取 /24 网段标识 (如 104.16.85.0/24)
+        c_subnet = str(ipaddress.ip_network(f"{ip}/24", strict=False))
+        count = subnet_count.get(c_subnet, 0)
+        
+        # 限制同子网密度，达到 30 个时停止
+        if count < 2:
             seen_ips.add(ip)
-            tag_index = len(best_us_ips) + 1
-            formatted_entry = f"{ip}#🇺🇸美国{tag_index:02d}"
+            subnet_count[c_subnet] = count + 1
+            tag_idx = len(best_us_ips) + 1
+            formatted_entry = f"{ip}#🇺🇸美国{tag_idx:02d}"
             best_us_ips.append(formatted_entry)
-            print(f"🇺🇸 [{formatted_entry}] ({colo}) 延迟: {latency:.1f}ms")
-            
+            print(f"  └─ [{formatted_entry}] ({colo} 机房) 延迟: {latency:.1f}ms (网段: {c_subnet})")
+
         if len(best_us_ips) >= 30:
             break
 
-    # 写入文件
+    # 4. 写入根目录下的 best-cf-ipv4.txt
     output_path = "best-cf-ipv4.txt"
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("\n".join(best_us_ips) + "\n")
 
-    print(f"\n💾 优选完成！已将最优的 {len(best_us_ips)} 个带备注的美国 IPv4 写入 {output_path}")
+    print(f"\n💾 优选完成！已将最优的 {len(best_us_ips)} 个已打散美国 IPv4 写入 {output_path}")
 
 if __name__ == "__main__":
     main()
