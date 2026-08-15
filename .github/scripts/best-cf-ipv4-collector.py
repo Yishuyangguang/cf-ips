@@ -1,233 +1,156 @@
-import ipaddress
+import os
 import re
-import sys
+import socket
 import time
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import TYPE_CHECKING
+import ipaddress
+import concurrent.futures
+from urllib.request import Request, urlopen
 
-from curl_cffi import requests as cf_requests
+# Cloudflare 官方 IPv4 网段白名单
+CF_IPV4_NETWORKS = [
+    ipaddress.ip_network('173.245.48.0/20'),
+    ipaddress.ip_network('103.21.244.0/22'),
+    ipaddress.ip_network('103.22.200.0/22'),
+    ipaddress.ip_network('103.31.4.0/22'),
+    ipaddress.ip_network('141.101.64.0/18'),
+    ipaddress.ip_network('108.162.192.0/18'),
+    ipaddress.ip_network('190.93.240.0/20'),
+    ipaddress.ip_network('188.114.96.0/20'),
+    ipaddress.ip_network('197.234.240.0/22'),
+    ipaddress.ip_network('198.41.128.0/17'),
+    ipaddress.ip_network('162.158.0.0/15'),
+    ipaddress.ip_network('104.16.0.0/13'),
+    ipaddress.ip_network('104.24.0.0/14'),
+    ipaddress.ip_network('172.64.0.0/13'),
+    ipaddress.ip_network('131.0.72.0/22')
+]
 
-try:
-    from playwright.sync_api import sync_playwright
-except ImportError:
-    sync_playwright = None
+# 远程高质量 Cloudflare IP 数据源
+SOURCES = [
+    "https://raw.githubusercontent.com/ymyuuu/IPDB/main/bestcf.txt",
+    "https://raw.githubusercontent.com/ip-scanner/cloudflare/master/clean-ips.txt",
+    "https://raw.githubusercontent.com/vfarid/cf-clean-ips/main/list.txt",
+    "https://www.cloudflare.com/ips-v4"
+]
 
-try:
-    from ip2region import util
-    from ip2region.searcher import new_with_buffer
-except ImportError:
-    util = None
-    new_with_buffer = None
-
-if TYPE_CHECKING:
-    from ip2region.searcher import Searcher
-    from playwright.sync_api import Browser
-
-# 专供美国 IP 提取的精选数据源（剔除亚太杂质源）
-SOURCES: dict[str, str] = {
-    'https://proxyip.chatkg.qzz.io/': 'ChatKG-ProxyIP',  # 👈 新加的数据源
-    'https://raw.githubusercontent.com/gslege/CloudflareIP/refs/heads/main/US.txt': 'Gslege-US',
-    'https://bestcf.pages.dev/xinyitang3/ipv4.txt': 'Mia',
-    'https://raw.githubusercontent.com/ymyuuu/IPDB/refs/heads/main/BestCF/bestcfv4.txt': 'IPDB',
-    'https://vps789.com/openApi/cfIpApi': 'VPS789',
-    'https://api.4ce.cn/api/bestCFIP': 'vvhan',
-    'https://ip.164746.xyz': 'https://ip.164746.xyz',
+# 🇺🇸 Cloudflare 美国本土所有核心机房机场代码（IATA COLO）
+US_COLO_SET = {
+    # 美西
+    'LAX', 'SFO', 'SJC', 'SMF', 'SAN', 'SEA', 'PDX', 'PHX', 'LAS', 'SLC', 'DEN', 'BOI', 'RNO',
+    # 美中
+    'DFW', 'IAH', 'SAT', 'AUS', 'OKC', 'MCI', 'STL', 'ORD', 'MSP', 'IND', 'CMH', 'CLE', 'DTW', 'OMA', 'DSM', 'MEM', 'BNA',
+    # 美东与美南
+    'ATL', 'MIA', 'TPA', 'MCO', 'JAX', 'CLT', 'RDU', 'RIC', 'IAD', 'BWI', 'PHL', 'EWR', 'JFK', 'LGA', 'BOS', 'BDL', 'PIT', 'BUF',
+    # 夏威夷与阿拉斯加
+    'HNL', 'ANC'
 }
 
-PORT: str = '443'
-HEADERS: dict[str, str] = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-                  '(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0',
-}
-IPV4_PATTERN: str = r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'
-OUTPUT_FILE: Path = Path('best-cf-ipv4.txt')
-XDB_URL: str = 'https://raw.githubusercontent.com/lionsoul2014/ip2region/master/data/ip2region_v4.xdb'
-XDB_FILE: Path = Path(__file__).resolve().parent / 'data' / 'ip2region_v4.xdb'
-MAX_RETRIES: int = 3
-RETRY_BACKOFF_FACTOR: float = 2.0
+def is_cloudflare_ip(ip_str):
+    """严格校验是否为 Cloudflare 官方公网 IPv4"""
+    try:
+        ip_obj = ipaddress.ip_address(ip_str)
+        return any(ip_obj in net for net in CF_IPV4_NETWORKS)
+    except ValueError:
+        return False
 
-
-def _session() -> cf_requests.Session:
-    session = cf_requests.Session(impersonate='chrome')
-    session.headers.update(HEADERS)
-    return session
-
-
-def fetch(session: cf_requests.Session, url: str, timeout: int = 15) -> str:
-    last_err: Exception | None = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            resp = session.get(url, timeout=timeout)
-            resp.raise_for_status()
-            return resp.text
-        except Exception as e:
-            last_err = e
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_BACKOFF_FACTOR ** attempt)
-    assert last_err is not None
-    raise last_err
-
-
-def extract_ipv4(text: str) -> set[str]:
-    ips: set[str] = set()
-    for match in re.finditer(IPV4_PATTERN, text):
-        try:
-            ip = ipaddress.ip_address(match.group())
-            ips.add(str(ip))
-        except ValueError:
-            continue
+def fetch_source_ips(url):
+    """带超时与容错的远程源抓取"""
+    ips = set()
+    try:
+        req = Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+        with urlopen(req, timeout=8) as response:
+            content = response.read().decode('utf-8', errors='ignore')
+            matches = re.findall(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b', content)
+            for ip in matches:
+                if is_cloudflare_ip(ip):
+                    ips.add(ip)
+        print(f"✅ 成功从 [{url}] 抓取并清洗出 {len(ips)} 个有效 CF 节点")
+    except Exception as e:
+        print(f"⚠️ 跳过异常源 [{url}]: {e}")
     return ips
 
-
-def _ensure_xdb() -> None:
-    if XDB_FILE.exists():
-        return
-    XDB_FILE.parent.mkdir(parents=True, exist_ok=True)
-    print(f'Downloading {XDB_URL} ...')
-    with _session() as sess:
-        resp = sess.get(XDB_URL, timeout=120)
-        resp.raise_for_status()
-        XDB_FILE.write_bytes(resp.content)
-
-
-_searcher = None
-
-
-def _get_searcher() -> 'Searcher':
-    global _searcher
-    if new_with_buffer is None:
-        raise RuntimeError('ip2region 未安装')
-    if _searcher is None:
-        _ensure_xdb()
-        _searcher = new_with_buffer(
-            util.version_from_header(util.load_header_from_file(str(XDB_FILE))),
-            util.load_content_from_file(str(XDB_FILE)),
+def test_and_filter_us_ip(ip, timeout=2.0):
+    """
+    测速 + 美国机房（Colo）精准嗅探
+    返回: (ip, latency_ms, colo_code) 或 (ip, None, None)
+    """
+    start_time = time.time()
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((ip, 80))
+        
+        http_req = (
+            f"GET /cdn-cgi/trace HTTP/1.1\r\n"
+            f"Host: speed.cloudflare.com\r\n"
+            f"User-Agent: Mozilla/5.0\r\n"
+            f"Connection: close\r\n\r\n"
         )
-    return _searcher
-
-
-def lookup_country(ip: str) -> str:
-    try:
-        region = _get_searcher().search(ip)
-        code = region.split('|')[-1].strip()
-        if re.fullmatch(r'[A-Z]{2}', code):
-            return code
+        sock.sendall(http_req.encode('utf-8'))
+        
+        response = sock.recv(1024).decode('utf-8', errors='ignore')
+        sock.close()
+        
+        latency_ms = (time.time() - start_time) * 1000
+        
+        # 提取机房代码 (如 colo=LAX)
+        colo_match = re.search(r'colo=([A-Z]{3})', response)
+        if colo_match:
+            colo = colo_match.group(1)
+            if colo in US_COLO_SET:
+                return (ip, latency_ms, colo)
+        
+        return (ip, None, None)
     except Exception:
-        pass
-    return 'XX'
+        return (ip, None, None)
 
+def main():
+    print("🚀 开始收集 Cloudflare 官方 IPv4 节点池...")
+    all_raw_ips = set()
 
-def beijing_timestamp() -> str:
-    return (datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%Y-%m-%d %H:%M')
+    for url in SOURCES:
+        all_raw_ips.update(fetch_source_ips(url))
 
+    print(f"\n📊 汇总去重后待测 IP 总量: {len(all_raw_ips)} 个")
+    if not all_raw_ips:
+        print("❌ 未获取到可用 IP，退出")
+        return
 
-_browser = None
-_pw = None
+    print("⚡ 启动 50 线程并发进行【延迟测速 + 美国机房嗅探】...")
+    us_results = []
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+        futures = {executor.submit(test_and_filter_us_ip, ip): ip for ip in all_raw_ips}
+        for future in concurrent.futures.as_completed(futures):
+            ip, latency, colo = future.result()
+            if latency is not None and colo is not None:
+                us_results.append((ip, latency, colo))
 
+    # 按延迟由低到高排序
+    us_results.sort(key=lambda x: x[1])
+    print(f"\n🎉 成功嗅探到纯美国 (US) 节点: {len(us_results)} 个")
 
-def _get_browser() -> 'Browser':
-    global _browser, _pw
-    if sync_playwright is None:
-        raise RuntimeError('Playwright 未安装')
-    if _browser is None:
-        _pw = sync_playwright().start()
-        _browser = _pw.chromium.launch(headless=True)
-    return _browser
+    # 提取前 30 个最优且绝对唯一的美国 IP，并自动添加 🇺🇸美国01~30 备注
+    seen_ips = set()
+    best_us_ips = []
+    
+    for ip, latency, colo in us_results:
+        if ip not in seen_ips:
+            seen_ips.add(ip)
+            tag_index = len(best_us_ips) + 1
+            formatted_entry = f"{ip}#🇺🇸美国{tag_index:02d}"
+            best_us_ips.append(formatted_entry)
+            print(f"🇺🇸 [{formatted_entry}] ({colo}) 延迟: {latency:.1f}ms")
+            
+        if len(best_us_ips) >= 30:
+            break
 
+    # 写入文件
+    output_path = "best-cf-ipv4.txt"
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(best_us_ips) + "\n")
 
-def fetch_rendered(url: str, timeout: int = 30000) -> str:
-    context = _get_browser().new_context(user_agent=HEADERS['User-Agent'])
-    page = context.new_page()
-    try:
-        page.goto(url, wait_until='networkidle', timeout=timeout)
-        return page.content()
-    finally:
-        context.close()
+    print(f"\n💾 优选完成！已将最优的 {len(best_us_ips)} 个带备注的美国 IPv4 写入 {output_path}")
 
-
-def collect_ips(session: cf_requests.Session) -> set[str]:
-    all_ips: set[str] = set()
-    tiers = [
-        ('HTTP', lambda u: fetch(session, u)),
-        ('Browser', fetch_rendered),
-    ]
-    for url, name in SOURCES.items():
-        for label, fetcher in tiers:
-            try:
-                ips = extract_ipv4(fetcher(url))
-            except Exception as e:
-                print(f'  [{name}] {label} 尝试失败: {e}')
-                continue
-            if ips:
-                all_ips.update(ips)
-                print(f'  [{name}] {label} 成功抓取: {len(ips)} 个 IPv4')
-                break
-            print(f'  [{name}] {label}: 0 个 IP，尝试降级...')
-        else:
-            print(f'  [{name}] 所有模式均失败')
-    return all_ips
-
-
-def filter_top_30_us_ips(all_ips: set[str], target_count: int = 30) -> list[str]:
-    _get_searcher()
-
-    # 离线识别校验，严格抽取美国节点
-    us_ips = [ip for ip in all_ips if lookup_country(ip) == 'US']
-    print(f'🇺🇸 成功筛选到 {len(us_ips)} 个美国节点，进行 C 段打散精选...')
-
-    seen_subnets = set()
-    selected_ips = []
-
-    # C 段分散，优先选取不同网段的 IP
-    for ip in us_ips:
-        c_subnet = '.'.join(ip.split('.')[:3])
-        if c_subnet not in seen_subnets:
-            seen_subnets.add(c_subnet)
-            selected_ips.append(ip)
-            if len(selected_ips) == target_count:
-                break
-
-    # 补充不足数量
-    if len(selected_ips) < target_count:
-        for ip in us_ips:
-            if ip not in selected_ips:
-                selected_ips.append(ip)
-                if len(selected_ips) == target_count:
-                    break
-
-    return selected_ips
-
-
-def main() -> int:
-    print('🚀 开始拉取 Cloudflare 节点数据...\n')
-    session = _session()
-
-    all_ips = collect_ips(session)
-    if not all_ips:
-        print('❌ 未抓取到任何 IP')
-        return 1
-    print(f'\n全网去重共得 {len(all_ips)} 个唯一 IPv4')
-
-    final_us_ips = filter_top_30_us_ips(all_ips, target_count=30)
-
-    if not final_us_ips:
-        print('❌ 未匹配到美国节点')
-        return 1
-
-    tmp = OUTPUT_FILE.with_suffix('.tmp')
-    timestamp = beijing_timestamp()
-
-    # 输出格式：IP:443#🇺🇸美国01 ~ 30
-    with tmp.open('w', encoding='utf-8') as f:
-        f.write(f'#{len(final_us_ips)} best US ips updated at {timestamp}\n')
-        for idx, ip in enumerate(final_us_ips, 1):
-            f.write(f'{ip}:{PORT}#🇺🇸美国{idx:02d}\n')
-
-    tmp.replace(OUTPUT_FILE)
-    print(f'\n✅ 成功筛选出 {len(final_us_ips)} 个完全独立的美国节点，已保存至 {OUTPUT_FILE}')
-    return 0
-
-
-if __name__ == '__main__':
-    sys.exit(main())
+if __name__ == "__main__":
+    main()
