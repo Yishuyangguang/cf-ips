@@ -33,7 +33,7 @@ SOURCES = [
     "https://raw.githubusercontent.com/vfarid/cf-clean-ips/main/list.txt"
 ]
 
-# 3. 🇺🇸 Cloudflare 美国本土核心机房机场代码（IATA COLO）
+# 3. 🇺🇸 Cloudflare 美国本土核心机房代码（IATA COLO）
 US_COLO_SET = {
     # 美西
     'LAX', 'SFO', 'SJC', 'SMF', 'SAN', 'SEA', 'PDX', 'PHX', 'LAS', 'SLC', 'DEN', 'BOI', 'RNO',
@@ -109,6 +109,7 @@ def trace_us_node(ip, timeout=1.5):
         data = ssl_sock.recv(4096).decode('utf-8', errors='ignore')
         latency_ms = (time.time() - start_time) * 1000
 
+        # 核心：双重确认机房属于美国本土
         if "colo=" in data:
             colo_match = re.search(r'colo=([A-Z]{3})', data)
             loc_match = re.search(r'loc=([A-Z]{2})', data)
@@ -137,7 +138,7 @@ def main():
 
     print(f"\n📊 汇总去重后待测 IP 总量: {len(all_raw_ips)} 个")
 
-    # 1. 快速 TCP 粗筛
+    # 1. 毫秒级 TCP 快速探活粗筛
     print("⚡ 启动 60 线程进行极速 TCP 探活粗筛...")
     alive_ips = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=60) as executor:
@@ -162,7 +163,7 @@ def main():
     us_results.sort(key=lambda x: x[1])
     print(f"\n🇺🇸 成功嗅探到纯正美国节点: {len(us_results)} 个")
 
-    # 3. C 段网段打散算法（每个 /24 子网最多取 2 个 IP）
+    # 3. C 段网段打散并生成标准命名（IP#🇺🇸美国01 ~ 30）
     subnet_count = {}
     best_us_ips = []
     seen_ips = set()
@@ -190,7 +191,7 @@ def main():
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("\n".join(best_us_ips) + "\n")
 
-    print(f"\n💾 优选完成！已将最优的 {len(best_us_ips)} 个美国 IPv4 写入 {output_path}")
+    print(f"\n💾 优选完成！已将最优的 {len(best_us_ips)} 个纯美国 IPv4 写入 {output_path}")
 
 if __name__ == "__main__":
     main()
