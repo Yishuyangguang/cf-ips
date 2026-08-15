@@ -1,59 +1,45 @@
-name: Collect Best CF IPV4
+name: Collect Best Cloudflare IPv4
 
 on:
   schedule:
-    - cron: '0 0 * * *'  # 每天 UTC 0点 (北京时间每天上午 8:00 自动更新)
-  workflow_dispatch:      # 支持网页手动点击触发
+    - cron: '0 */6 * * *' # 每 6 小时自动运行一次
+  workflow_dispatch:      # 支持手动一键运行
 
 concurrency:
-  group: Collect Best CF IPV4
-  cancel-in-progress: false
+  group: cf-ips-collector
+  cancel-in-progress: true
 
 permissions:
   contents: write
 
 jobs:
-  collect-best-cf-ipv4:
+  collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - name: Checkout Repository
+        uses: actions/checkout@v4
         with:
-          python-version: '3.12'
+          fetch-depth: 0
 
-      - name: Install dependencies
-        run: pip install -r .github/scripts/requirements.txt
-
-      - name: Get Playwright version
-        id: pw-version
-        run: |
-          VERSION=$(python -c 'from importlib.metadata import version; print(version("playwright"))')
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-
-      - name: Cache Playwright browsers
-        id: pw-cache
-        uses: actions/cache@v4
+      - name: Set up Python
+        uses: setup-python@v5
         with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ steps.pw-version.outputs.version }}
+          python-version: '3.10'
 
-      - name: Install Playwright Chromium
-        if: steps.pw-cache.outputs.cache-hit != 'true'
-        run: python -m playwright install --with-deps chromium
-
-      - name: Collect Best CF IPV4
-        run: python3 .github/scripts/best-cf-ipv4-collector.py
-
-      - name: Commit update
+      - name: Run Collector Script
         run: |
-          git config user.name "GitHub Action"
-          git config user.email "action@github.com"
+          python .github/scripts/best-cf-ipv4-collector.py
+
+      - name: Commit and Push Changes
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
           git add best-cf-ipv4.txt
-          git diff --cached --quiet && echo "No changes to commit" && exit 0
-          git commit -m "Best CF US ipv4 list updated $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M')"
-          git pull --rebase
-          git push
+          
+          if git diff --staged --quiet; then
+            echo "✅ 节点列表无变更，无需重复提交。"
+          else
+            git commit -m "Auto Update: Best 30 US Cloudflare IPv4 [skip ci]"
+            git pull --rebase origin main || true
+            git push origin main
+          fi
