@@ -32,5 +32,5 @@ jobs:
             echo "No changes to commit."
           else
             git commit -m "Auto Update: Best 30 US Cloudflare IPv4 [skip ci]"
-            git push
+            git push origin ${{ github.ref_name }}
           fi
