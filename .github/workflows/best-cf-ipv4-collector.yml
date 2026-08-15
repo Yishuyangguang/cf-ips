@@ -2,12 +2,8 @@ name: Collect Best Cloudflare IPv4
 
 on:
   schedule:
-    - cron: '0 0 * * *' # 每天运行一次（24 小时周期）
-  workflow_dispatch:      # 依然保留手动一键运行按钮
-
-concurrency:
-  group: cf-ips-collector
-  cancel-in-progress: true
+    - cron: '0 0 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -18,8 +14,6 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up Python
         uses: setup-python@v5
@@ -32,14 +26,12 @@ jobs:
 
       - name: Commit and Push Changes
         run: |
-          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           git add best-cf-ipv4.txt
-          
           if git diff --staged --quiet; then
-            echo "✅ 节点列表无变化，无需重复提交。"
+            echo "No changes to commit."
           else
-            git commit -m "Auto Update: Best 30 US Cloudflare IPv4 [skip ci]"
-            git pull --rebase origin HEAD || true
-            git push origin HEAD
+            git commit -m "Auto Update: Best 30 US Cloudflare IPv4"
+            git push
           fi
